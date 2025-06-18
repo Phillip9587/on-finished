@@ -14,6 +14,10 @@ describe('onFinished(res, listener)', function () {
     onFinished({}, done)
   })
 
+  it('should throw TypeError if listener is not a function', function () {
+    assert.throws(() => { onFinished({}, 'not a function') }, /listener must be a function/)
+  })
+
   describe('when the response finishes', function () {
     it('should fire the callback', function (done) {
       var server = http.createServer(function (req, res) {
@@ -407,6 +411,10 @@ describe('isFinished(res)', function () {
 })
 
 describe('onFinished(req, listener)', function () {
+  it('should throw TypeError if listener is not a function', function () {
+    assert.throws(() => { onFinished({}, 'not a function') }, /listener must be a function/)
+  })
+
   describe('when the request finishes', function () {
     it('should fire the callback', function (done) {
       var server = http.createServer(function (req, res) {
