@@ -1,51 +1,75 @@
 const assert = require('assert')
 const { AsyncLocalStorage } = require('async_hooks')
 const http = require('http')
+const http2 = require('http2')
 const net = require('net')
 const onFinished = require('..')
 
-describe('onFinished(res, listener)', function () {
-  it('should invoke listener given an unknown object', function (done) {
-    onFinished({}, done)
-  })
-
-  it('should throw TypeError if listener is not a function', function () {
-    assert.throws(() => { onFinished({}, 'not a function') }, /listener must be a function/)
-  })
-
-  describe('when the response finishes', function () {
-    it('should fire the callback', function (done) {
-      var server = http.createServer(function (req, res) {
-        onFinished(res, done)
-        setTimeout(res.end.bind(res), 0)
-      })
-
-      sendGet(server)
+for (const protocol of ['http', 'http2']) {
+  describe(protocol + ' - onFinished(res, listener)', function () {
+    it('should invoke listener given an unknown object', function (done) {
+      onFinished({}, done)
     })
 
-    it('should include the response object', function (done) {
-      var server = http.createServer(function (req, res) {
-        onFinished(res, function (err, msg) {
-          assert.ok(!err)
-          assert.strictEqual(msg, res)
-          done()
+    it('should throw TypeError if listener is not a function', function () {
+      assert.throws(() => { onFinished({}, 'not a function') }, /listener must be a function/)
+    })
+
+    describe('when the response finishes', function () {
+      it('should fire the callback', function (done) {
+        var server = createServer(protocol, function (req, res) {
+          onFinished(res, done)
+          setTimeout(res.end.bind(res), 0)
         })
-        setTimeout(res.end.bind(res), 0)
+
+        sendGet(server, protocol)
       })
 
-      sendGet(server)
-    })
-
-    describe('when called after finish', function () {
-      it('should fire when called after finish', function (done) {
-        var server = http.createServer(function (req, res) {
-          onFinished(res, function () {
-            onFinished(res, done)
+      it('should include the response object', function (done) {
+        var server = createServer(protocol, function (req, res) {
+          onFinished(res, function (err, msg) {
+            assert.ok(!err)
+            assert.strictEqual(msg, res)
+            done()
           })
           setTimeout(res.end.bind(res), 0)
         })
 
-        sendGet(server)
+        sendGet(server, protocol)
+      })
+
+      describe('when called after finish', function () {
+        it('should fire when called after finish', function (done) {
+          var server = createServer(protocol, function (req, res) {
+            onFinished(res, function () {
+              onFinished(res, done)
+            })
+            setTimeout(res.end.bind(res), 0)
+          })
+
+          sendGet(server, protocol)
+        })
+
+        describe('when async local storage', function () {
+          it('should presist store in callback', function (done) {
+            var asyncLocalStorage = new AsyncLocalStorage()
+            var store = { foo: 'bar' }
+
+            var server = createServer(protocol, function (req, res) {
+              onFinished(res, function () {
+                asyncLocalStorage.run(store, function () {
+                  onFinished(res, function () {
+                    assert.strictEqual(asyncLocalStorage.getStore().foo, 'bar')
+                    done()
+                  })
+                })
+              })
+              setTimeout(res.end.bind(res), 0)
+            })
+
+            sendGet(server, protocol)
+          })
+        })
       })
 
       describe('when async local storage', function () {
@@ -53,399 +77,450 @@ describe('onFinished(res, listener)', function () {
           var asyncLocalStorage = new AsyncLocalStorage()
           var store = { foo: 'bar' }
 
-          var server = http.createServer(function (req, res) {
-            onFinished(res, function () {
-              asyncLocalStorage.run(store, function () {
-                onFinished(res, function () {
-                  assert.strictEqual(asyncLocalStorage.getStore().foo, 'bar')
-                  done()
-                })
+          var server = createServer(protocol, function (req, res) {
+            asyncLocalStorage.run(store, function () {
+              onFinished(res, function () {
+                assert.strictEqual(asyncLocalStorage.getStore().foo, 'bar')
+                done()
               })
             })
             setTimeout(res.end.bind(res), 0)
           })
 
-          sendGet(server)
+          sendGet(server, protocol)
         })
       })
     })
 
-    describe('when async local storage', function () {
-      it('should presist store in callback', function (done) {
-        var asyncLocalStorage = new AsyncLocalStorage()
-        var store = { foo: 'bar' }
-
-        var server = http.createServer(function (req, res) {
-          asyncLocalStorage.run(store, function () {
-            onFinished(res, function () {
-              assert.strictEqual(asyncLocalStorage.getStore().foo, 'bar')
-              done()
-            })
-          })
-          setTimeout(res.end.bind(res), 0)
-        })
-
-        sendGet(server)
-      })
-    })
-  })
-
-  describe('when using keep-alive', function () {
-    it('should fire for each response', function (done) {
-      var called = false
-      var server = http.createServer(function (req, res) {
-        onFinished(res, function () {
-          if (called) {
-            socket.end()
-            server.close()
-            done(called !== req ? null : new Error('fired twice on same req'))
-            return
-          }
-
-          called = req
-
-          writeRequest(socket)
-        })
-
-        res.end()
-      })
-      var socket
-
-      server.listen(function () {
-        socket = net.connect(this.address().port, function () {
-          writeRequest(this)
-        })
-      })
-    })
-  })
-
-  describe('when requests pipelined', function () {
-    it('should fire for each request', function (done) {
-      var count = 0
-      var responses = []
-      var server = http.createServer(function (req, res) {
-        responses.push(res)
-
-        onFinished(res, function (err) {
-          assert.ifError(err)
-          assert.strictEqual(responses[0], res)
-          responses.shift()
-
-          if (responses.length === 0) {
-            socket.end()
-            return
-          }
-
-          responses[0].end('response b')
-        })
-
-        onFinished(req, function (err) {
-          assert.ifError(err)
-
-          if (++count !== 2) {
-            return
-          }
-
-          assert.strictEqual(responses.length, 2)
-          responses[0].end('response a')
-        })
-
-        if (responses.length === 1) {
-          // second request
-          writeRequest(socket)
+    describe('when using keep-alive', function () {
+      it('should fire for each response', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 doesn't use keep-alive connections, it uses multiplexing
+          return this.skip()
         }
 
-        req.resume()
-      })
-      var socket
+        var called = false
+        var server = createServer(protocol, function (req, res) {
+          onFinished(res, function () {
+            if (called) {
+              socket.end()
+              server.close()
+              done(called !== req ? null : new Error('fired twice on same req'))
+              return
+            }
 
-      server.listen(function () {
-        var data = ''
-        socket = net.connect(this.address().port, function () {
-          writeRequest(this)
+            called = req
+
+            writeRequest(socket)
+          })
+
+          res.end()
         })
+        var socket
 
-        socket.on('data', function (chunk) {
-          data += chunk.toString('binary')
-        })
-        socket.on('end', function () {
-          assert.ok(/response a/.test(data))
-          assert.ok(/response b/.test(data))
-          server.close(done)
-        })
-      })
-    })
-  })
-
-  describe('when response errors', function () {
-    it('should fire with error', function (done) {
-      var server = http.createServer(function (req, res) {
-        onFinished(res, function (err) {
-          assert.ok(err)
-          server.close(done)
-        })
-
-        socket.on('error', noop)
-        socket.write('W')
-      })
-      var socket
-
-      server.listen(function () {
-        socket = net.connect(this.address().port, function () {
-          writeRequest(this, true)
+        server.listen(function () {
+          socket = net.connect(this.address().port, function () {
+            writeRequest(this)
+          })
         })
       })
     })
 
-    it('should include the response object', function (done) {
-      var server = http.createServer(function (req, res) {
-        onFinished(res, function (err, msg) {
-          assert.ok(err)
-          assert.strictEqual(msg, res)
-          server.close(done)
-        })
+    describe('when requests pipelined', function () {
+      it('should fire for each request', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 doesn't use pipelining, it uses multiplexing
+          return this.skip()
+        }
 
-        socket.on('error', noop)
-        socket.write('W')
-      })
-      var socket
+        var count = 0
+        var responses = []
+        var server = createServer(protocol, function (req, res) {
+          responses.push(res)
 
-      server.listen(function () {
-        socket = net.connect(this.address().port, function () {
-          writeRequest(this, true)
-        })
-      })
-    })
-  })
+          onFinished(res, function (err) {
+            assert.ifError(err)
+            assert.strictEqual(responses[0], res)
+            responses.shift()
 
-  describe('when the response aborts', function () {
-    it('should execute the callback', function (done) {
-      var client
-      var server = http.createServer(function (req, res) {
-        onFinished(res, close(server, done))
-        setTimeout(client.abort.bind(client), 0)
-      })
-      server.listen(function () {
-        var port = this.address().port
-        client = http.get('http://127.0.0.1:' + port)
-        client.on('error', noop)
-      })
-    })
-  })
+            if (responses.length === 0) {
+              socket.end()
+              return
+            }
 
-  describe('when calling many times on same response', function () {
-    it('should not print warnings', function (done) {
-      var server = http.createServer(function (req, res) {
-        var stderr = captureStderr(function () {
-          for (var i = 0; i < 400; i++) {
-            onFinished(res, noop)
+            responses[0].end('response b')
+          })
+
+          onFinished(req, function (err) {
+            assert.ifError(err)
+
+            if (++count !== 2) {
+              return
+            }
+
+            assert.strictEqual(responses.length, 2)
+            responses[0].end('response a')
+          })
+
+          if (responses.length === 1) {
+            // second request
+            writeRequest(socket)
           }
+
+          req.resume()
+        })
+        var socket
+
+        server.listen(function () {
+          var data = ''
+          socket = net.connect(this.address().port, function () {
+            writeRequest(this)
+          })
+
+          socket.on('data', function (chunk) {
+            data += chunk.toString('binary')
+          })
+          socket.on('end', function () {
+            assert.ok(/response a/.test(data))
+            assert.ok(/response b/.test(data))
+            server.close(done)
+          })
+        })
+      })
+    })
+
+    describe('when response errors', function () {
+      it('should fire with error', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 error handling is different - raw socket manipulation doesn't apply
+          return this.skip()
+        }
+
+        var server = createServer(protocol, function (req, res) {
+          onFinished(res, function (err) {
+            assert.ok(err)
+            server.close(done)
+          })
+
+          socket.on('error', noop)
+          socket.write('W')
+        })
+        var socket
+
+        server.listen(function () {
+          socket = net.connect(this.address().port, function () {
+            writeRequest(this, true)
+          })
+        })
+      })
+
+      it('should include the response object', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 error handling is different - raw socket manipulation doesn't apply
+          return this.skip()
+        }
+
+        var server = createServer(protocol, function (req, res) {
+          onFinished(res, function (err, msg) {
+            assert.ok(err)
+            assert.strictEqual(msg, res)
+            server.close(done)
+          })
+
+          socket.on('error', noop)
+          socket.write('W')
+        })
+        var socket
+
+        server.listen(function () {
+          socket = net.connect(this.address().port, function () {
+            writeRequest(this, true)
+          })
+        })
+      })
+    })
+
+    describe('when the response aborts', function () {
+      it('should execute the callback', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 abort mechanism is different - need to test with HTTP2-specific abort
+          return this.skip()
+        }
+
+        var client
+        var server = createServer(protocol, function (req, res) {
+          onFinished(res, close(server, done))
+          setTimeout(client.abort.bind(client), 0)
+        })
+        server.listen(function () {
+          var port = this.address().port
+          client = http.get('http://127.0.0.1:' + port)
+          client.on('error', noop)
+        })
+      })
+    })
+
+    describe('when calling many times on same response', function () {
+      it('should not print warnings', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 uses different HTTP client - raw socket access won't work
+          return this.skip()
+        }
+
+        var server = createServer(protocol, function (req, res) {
+          var stderr = captureStderr(function () {
+            for (var i = 0; i < 400; i++) {
+              onFinished(res, noop)
+            }
+          })
+
+          onFinished(res, done)
+          assert.strictEqual(stderr, '')
+          res.end()
         })
 
-        onFinished(res, done)
-        assert.strictEqual(stderr, '')
+        server.listen(function () {
+          var port = this.address().port
+          http.get('http://127.0.0.1:' + port, function (res) {
+            res.resume()
+            res.on('end', server.close.bind(server))
+          })
+        })
+      })
+    })
+  })
+
+  describe(protocol + ' - isFinished(res)', function () {
+    it('should return undefined for unknown object', function () {
+      assert.strictEqual(onFinished.isFinished({}), undefined)
+    })
+
+    it('should be false before response finishes', function (done) {
+      var server = createServer(protocol, function (req, res) {
+        assert.ok(!onFinished.isFinished(res))
         res.end()
-      })
-
-      server.listen(function () {
-        var port = this.address().port
-        http.get('http://127.0.0.1:' + port, function (res) {
-          res.resume()
-          res.on('end', server.close.bind(server))
-        })
-      })
-    })
-  })
-})
-
-describe('isFinished(res)', function () {
-  it('should return undefined for unknown object', function () {
-    assert.strictEqual(onFinished.isFinished({}), undefined)
-  })
-
-  it('should be false before response finishes', function (done) {
-    var server = http.createServer(function (req, res) {
-      assert.ok(!onFinished.isFinished(res))
-      res.end()
-      done()
-    })
-
-    sendGet(server)
-  })
-
-  it('should be true after response finishes', function (done) {
-    var server = http.createServer(function (req, res) {
-      onFinished(res, function (err) {
-        assert.ifError(err)
-        assert.ok(onFinished.isFinished(res))
         done()
       })
 
-      res.end()
+      sendGet(server, protocol)
     })
 
-    sendGet(server)
-  })
-
-  describe('when requests pipelined', function () {
-    it('should have correct state when socket shared', function (done) {
-      var count = 0
-      var responses = []
-      var server = http.createServer(function (req, res) {
-        responses.push(res)
-
-        onFinished(req, function (err) {
-          assert.ifError(err)
-
-          if (++count !== 2) {
-            return
-          }
-
-          assert.ok(!onFinished.isFinished(responses[0]))
-          assert.ok(!onFinished.isFinished(responses[1]))
-
-          responses[0].end()
-          responses[1].end()
-          socket.end()
-          server.close(done)
-        })
-
-        if (responses.length === 1) {
-          // second request
-          writeRequest(socket)
-        }
-
-        req.resume()
-      })
-      var socket
-
-      server.listen(function () {
-        socket = net.connect(this.address().port, function () {
-          writeRequest(this)
-        })
-      })
-    })
-
-    it('should handle aborted requests', function (done) {
-      var count = 0
-      var requests = 0
-      var server = http.createServer(function (req, res) {
-        requests++
-
-        onFinished(req, function (err) {
-          switch (++count) {
-            case 1:
-              assert.ifError(err)
-              // abort the socket
-              socket.on('error', noop)
-              socket.destroy()
-              break
-            case 2:
-              server.close(done)
-              break
-          }
-        })
-
-        req.resume()
-
-        if (requests === 1) {
-          // second request
-          writeRequest(socket, true)
-        }
-      })
-      var socket
-
-      server.listen(function () {
-        socket = net.connect(this.address().port, function () {
-          writeRequest(this)
-        })
-      })
-    })
-  })
-
-  describe('when response errors', function () {
-    it('should return true', function (done) {
-      var server = http.createServer(function (req, res) {
-        onFinished(res, function (err) {
-          assert.ok(err)
-          assert.ok(onFinished.isFinished(res))
-          server.close(done)
-        })
-
-        socket.on('error', noop)
-        socket.write('W')
-      })
-      var socket
-
-      server.listen(function () {
-        socket = net.connect(this.address().port, function () {
-          writeRequest(this, true)
-        })
-      })
-    })
-  })
-
-  describe('when the response aborts', function () {
-    it('should return true', function (done) {
-      var client
-      var server = http.createServer(function (req, res) {
+    it('should be true after response finishes', function (done) {
+      var server = createServer(protocol, function (req, res) {
         onFinished(res, function (err) {
           assert.ifError(err)
           assert.ok(onFinished.isFinished(res))
-          server.close(done)
-        })
-        setTimeout(client.abort.bind(client), 0)
-      })
-      server.listen(function () {
-        var port = this.address().port
-        client = http.get('http://127.0.0.1:' + port)
-        client.on('error', noop)
-      })
-    })
-  })
-})
-
-describe('onFinished(req, listener)', function () {
-  it('should throw TypeError if listener is not a function', function () {
-    assert.throws(() => { onFinished({}, 'not a function') }, /listener must be a function/)
-  })
-
-  describe('when the request finishes', function () {
-    it('should fire the callback', function (done) {
-      var server = http.createServer(function (req, res) {
-        onFinished(req, done)
-        req.resume()
-        setTimeout(res.end.bind(res), 0)
-      })
-
-      sendGet(server)
-    })
-
-    it('should include the request object', function (done) {
-      var server = http.createServer(function (req, res) {
-        onFinished(req, function (err, msg) {
-          assert.ok(!err)
-          assert.strictEqual(msg, req)
           done()
         })
-        req.resume()
-        setTimeout(res.end.bind(res), 0)
+
+        res.end()
       })
 
-      sendGet(server)
+      sendGet(server, protocol)
     })
 
-    describe('when called after finish', function () {
-      it('should fire when called after finish', function (done) {
-        var server = http.createServer(function (req, res) {
-          onFinished(req, function () {
-            onFinished(req, done)
+    describe('when requests pipelined', function () {
+      it('should have correct state when socket shared', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 doesn't use pipelining, it uses multiplexing
+          return this.skip()
+        }
+
+        var count = 0
+        var responses = []
+        var server = createServer(protocol, function (req, res) {
+          responses.push(res)
+
+          onFinished(req, function (err) {
+            assert.ifError(err)
+
+            if (++count !== 2) {
+              return
+            }
+
+            assert.ok(!onFinished.isFinished(responses[0]))
+            assert.ok(!onFinished.isFinished(responses[1]))
+
+            responses[0].end()
+            responses[1].end()
+            socket.end()
+            server.close(done)
+          })
+
+          if (responses.length === 1) {
+            // second request
+            writeRequest(socket)
+          }
+
+          req.resume()
+        })
+        var socket
+
+        server.listen(function () {
+          socket = net.connect(this.address().port, function () {
+            writeRequest(this)
+          })
+        })
+      })
+
+      it('should handle aborted requests', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 doesn't use pipelining, it uses multiplexing
+          return this.skip()
+        }
+
+        var count = 0
+        var requests = 0
+        var server = createServer(protocol, function (req, res) {
+          requests++
+
+          onFinished(req, function (err) {
+            switch (++count) {
+              case 1:
+                assert.ifError(err)
+                // abort the socket
+                socket.on('error', noop)
+                socket.destroy()
+                break
+              case 2:
+                server.close(done)
+                break
+            }
+          })
+
+          req.resume()
+
+          if (requests === 1) {
+            // second request
+            writeRequest(socket, true)
+          }
+        })
+        var socket
+
+        server.listen(function () {
+          socket = net.connect(this.address().port, function () {
+            writeRequest(this)
+          })
+        })
+      })
+    })
+
+    describe('when response errors', function () {
+      it('should return true', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 error handling is different - raw socket manipulation doesn't apply
+          return this.skip()
+        }
+
+        var server = createServer(protocol, function (req, res) {
+          onFinished(res, function (err) {
+            assert.ok(err)
+            assert.ok(onFinished.isFinished(res))
+            server.close(done)
+          })
+
+          socket.on('error', noop)
+          socket.write('W')
+        })
+        var socket
+
+        server.listen(function () {
+          socket = net.connect(this.address().port, function () {
+            writeRequest(this, true)
+          })
+        })
+      })
+    })
+
+    describe('when the response aborts', function () {
+      it('should return true', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 abort mechanism is different - need to test with HTTP2-specific abort
+          return this.skip()
+        }
+
+        var client
+        var server = createServer(protocol, function (req, res) {
+          onFinished(res, function (err) {
+            assert.ifError(err)
+            assert.ok(onFinished.isFinished(res))
+            server.close(done)
+          })
+          setTimeout(client.abort.bind(client), 0)
+        })
+        server.listen(function () {
+          var port = this.address().port
+          client = http.get('http://127.0.0.1:' + port)
+          client.on('error', noop)
+        })
+      })
+    })
+  })
+
+  describe(protocol + ' - onFinished(req, listener)', function () {
+    it('should throw TypeError if listener is not a function', function () {
+      assert.throws(() => { onFinished({}, 'not a function') }, /listener must be a function/)
+    })
+
+    describe('when the request finishes', function () {
+      it('should fire the callback', function (done) {
+        var server = createServer(protocol, function (req, res) {
+          onFinished(req, done)
+          req.resume()
+          setTimeout(res.end.bind(res), 0)
+        })
+
+        sendGet(server, protocol)
+      })
+
+      it('should include the request object', function (done) {
+        var server = createServer(protocol, function (req, res) {
+          onFinished(req, function (err, msg) {
+            assert.ok(!err)
+            assert.strictEqual(msg, req)
+            done()
           })
           req.resume()
           setTimeout(res.end.bind(res), 0)
         })
 
-        sendGet(server)
+        sendGet(server, protocol)
+      })
+
+      describe('when called after finish', function () {
+        it('should fire when called after finish', function (done) {
+          var server = createServer(protocol, function (req, res) {
+            onFinished(req, function () {
+              onFinished(req, done)
+            })
+            req.resume()
+            setTimeout(res.end.bind(res), 0)
+          })
+
+          sendGet(server, protocol)
+        })
+
+        describe('when async local storage', function () {
+          it('should presist store in callback', function (done) {
+            var asyncLocalStorage = new AsyncLocalStorage()
+            var store = { foo: 'bar' }
+
+            var server = createServer(protocol, function (req, res) {
+              onFinished(req, function () {
+                asyncLocalStorage.run(store, function () {
+                  onFinished(req, function () {
+                    assert.strictEqual(asyncLocalStorage.getStore().foo, 'bar')
+                    done()
+                  })
+                })
+              })
+              req.resume()
+              setTimeout(res.end.bind(res), 0)
+            })
+
+            sendGet(server, protocol)
+          })
+        })
       })
 
       describe('when async local storage', function () {
@@ -453,677 +528,744 @@ describe('onFinished(req, listener)', function () {
           var asyncLocalStorage = new AsyncLocalStorage()
           var store = { foo: 'bar' }
 
-          var server = http.createServer(function (req, res) {
-            onFinished(req, function () {
-              asyncLocalStorage.run(store, function () {
-                onFinished(req, function () {
-                  assert.strictEqual(asyncLocalStorage.getStore().foo, 'bar')
-                  done()
-                })
+          var server = createServer(protocol, function (req, res) {
+            asyncLocalStorage.run(store, function () {
+              onFinished(req, function () {
+                assert.strictEqual(asyncLocalStorage.getStore().foo, 'bar')
+                done()
               })
             })
             req.resume()
             setTimeout(res.end.bind(res), 0)
           })
 
-          sendGet(server)
+          sendGet(server, protocol)
         })
       })
     })
 
-    describe('when async local storage', function () {
-      it('should presist store in callback', function (done) {
-        var asyncLocalStorage = new AsyncLocalStorage()
-        var store = { foo: 'bar' }
+    describe('when using keep-alive', function () {
+      it('should fire for each request', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 doesn't use keep-alive connections, it uses multiplexing
+          return this.skip()
+        }
 
-        var server = http.createServer(function (req, res) {
-          asyncLocalStorage.run(store, function () {
-            onFinished(req, function () {
-              assert.strictEqual(asyncLocalStorage.getStore().foo, 'bar')
-              done()
+        var called = false
+        var server = createServer(protocol, function (req, res) {
+          var data = ''
+
+          onFinished(req, function (err) {
+            assert.ifError(err)
+            assert.strictEqual(data, 'A')
+
+            if (called) {
+              socket.end()
+              server.close()
+              done(called !== req ? null : new Error('fired twice on same req'))
+              return
+            }
+
+            called = req
+
+            res.end()
+            writeRequest(socket, true)
+          })
+
+          req.setEncoding('utf8')
+          req.on('data', function (str) {
+            data += str
+          })
+
+          socket.write('1\r\nA\r\n')
+          socket.write('0\r\n\r\n')
+        })
+        var socket
+
+        server.listen(function () {
+          socket = net.connect(this.address().port, function () {
+            writeRequest(this, true)
+          })
+        })
+      })
+    })
+
+    describe('when request errors', function () {
+      it('should fire with error', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 error handling is different - raw socket manipulation doesn't apply
+          return this.skip()
+        }
+
+        var server = createServer(protocol, function (req, res) {
+          onFinished(req, function (err) {
+            assert.ok(err)
+            server.close(done)
+          })
+
+          socket.on('error', noop)
+          socket.write('W')
+        })
+        var socket
+
+        server.listen(function () {
+          socket = net.connect(this.address().port, function () {
+            writeRequest(this, true)
+          })
+        })
+      })
+
+      it('should include the request object', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 error handling is different - raw socket manipulation doesn't apply
+          return this.skip()
+        }
+
+        var server = createServer(protocol, function (req, res) {
+          onFinished(req, function (err, msg) {
+            assert.ok(err)
+            assert.strictEqual(msg, req)
+            server.close(done)
+          })
+
+          socket.on('error', noop)
+          socket.write('W')
+        })
+        var socket
+
+        server.listen(function () {
+          socket = net.connect(this.address().port, function () {
+            writeRequest(this, true)
+          })
+        })
+      })
+    })
+
+    describe('when requests pipelined', function () {
+      it('should handle socket errors', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 doesn't use pipelining, it uses multiplexing
+          return this.skip()
+        }
+
+        var count = 0
+        var server = createServer(protocol, function (req) {
+          var num = ++count
+
+          onFinished(req, function (err) {
+            assert.ok(err)
+            if (!--wait) server.close(done)
+          })
+
+          if (num === 1) {
+            // second request
+            writeRequest(socket, true)
+            req.pause()
+          } else {
+            // cause framing error in second request
+            socket.write('W')
+            req.resume()
+          }
+        })
+        var socket
+        var wait = 3
+
+        server.listen(function () {
+          socket = net.connect(this.address().port, function () {
+            writeRequest(this)
+          })
+
+          socket.on('close', function () {
+            assert.strictEqual(count, 2)
+            if (!--wait) server.close(done)
+          })
+
+          socket.resume()
+        })
+      })
+    })
+
+    describe('when the request aborts', function () {
+      it('should execute the callback', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 abort mechanism is different - need to test with HTTP2-specific abort
+          return this.skip()
+        }
+
+        var client
+        var server = createServer(protocol, function (req, res) {
+          onFinished(req, close(server, done))
+          setTimeout(client.abort.bind(client), 0)
+        })
+        server.listen(function () {
+          var port = this.address().port
+          client = http.get('http://127.0.0.1:' + port)
+          client.on('error', noop)
+        })
+      })
+    })
+
+    describe('when calling many times on same request', function () {
+      it('should not print warnings', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 uses different HTTP client - raw socket access won't work
+          return this.skip()
+        }
+
+        var server = createServer(protocol, function (req, res) {
+          var stderr = captureStderr(function () {
+            for (var i = 0; i < 400; i++) {
+              onFinished(req, noop)
+            }
+          })
+
+          onFinished(req, done)
+          assert.strictEqual(stderr, '')
+          res.end()
+        })
+
+        server.listen(function () {
+          var port = this.address().port
+          http.get('http://127.0.0.1:' + port, function (res) {
+            res.resume()
+            res.on('end', server.close.bind(server))
+          })
+        })
+      })
+    })
+
+    describe('when CONNECT method', function () {
+      it('should fire when request finishes', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 doesn't support CONNECT method in the same way as HTTP/1.1
+          return this.skip()
+        }
+
+        var client
+        var server = createServer(protocol, function (req, res) {
+          res.statusCode = 405
+          res.end()
+        })
+        server.on('connect', function (req, socket, bodyHead) {
+          var data = [bodyHead]
+
+          onFinished(req, function (err) {
+            assert.ifError(err)
+            assert.strictEqual(Buffer.concat(data).toString(), 'knock, knock')
+
+            socket.on('data', function (chunk) {
+              assert.strictEqual(chunk.toString(), 'ping')
+              socket.end('pong')
+            })
+            socket.write('HTTP/1.1 200 OK\r\n\r\n')
+          })
+
+          req.on('data', function (chunk) {
+            data.push(chunk)
+          })
+        })
+
+        server.listen(function () {
+          client = http.request({
+            hostname: '127.0.0.1',
+            method: 'CONNECT',
+            path: '127.0.0.1:80',
+            port: this.address().port
+          })
+          client.on('connect', function (res, socket, bodyHead) {
+            socket.write('ping')
+            socket.on('data', function (chunk) {
+              assert.strictEqual(chunk.toString(), 'pong')
+              socket.end()
+              server.close(done)
             })
           })
-          req.resume()
-          setTimeout(res.end.bind(res), 0)
-        })
-
-        sendGet(server)
-      })
-    })
-  })
-
-  describe('when using keep-alive', function () {
-    it('should fire for each request', function (done) {
-      var called = false
-      var server = http.createServer(function (req, res) {
-        var data = ''
-
-        onFinished(req, function (err) {
-          assert.ifError(err)
-          assert.strictEqual(data, 'A')
-
-          if (called) {
-            socket.end()
-            server.close()
-            done(called !== req ? null : new Error('fired twice on same req'))
-            return
-          }
-
-          called = req
-
-          res.end()
-          writeRequest(socket, true)
-        })
-
-        req.setEncoding('utf8')
-        req.on('data', function (str) {
-          data += str
-        })
-
-        socket.write('1\r\nA\r\n')
-        socket.write('0\r\n\r\n')
-      })
-      var socket
-
-      server.listen(function () {
-        socket = net.connect(this.address().port, function () {
-          writeRequest(this, true)
+          client.end('knock, knock')
         })
       })
-    })
-  })
 
-  describe('when request errors', function () {
-    it('should fire with error', function (done) {
-      var server = http.createServer(function (req, res) {
-        onFinished(req, function (err) {
-          assert.ok(err)
-          server.close(done)
-        })
-
-        socket.on('error', noop)
-        socket.write('W')
-      })
-      var socket
-
-      server.listen(function () {
-        socket = net.connect(this.address().port, function () {
-          writeRequest(this, true)
-        })
-      })
-    })
-
-    it('should include the request object', function (done) {
-      var server = http.createServer(function (req, res) {
-        onFinished(req, function (err, msg) {
-          assert.ok(err)
-          assert.strictEqual(msg, req)
-          server.close(done)
-        })
-
-        socket.on('error', noop)
-        socket.write('W')
-      })
-      var socket
-
-      server.listen(function () {
-        socket = net.connect(this.address().port, function () {
-          writeRequest(this, true)
-        })
-      })
-    })
-  })
-
-  describe('when requests pipelined', function () {
-    it('should handle socket errors', function (done) {
-      var count = 0
-      var server = http.createServer(function (req) {
-        var num = ++count
-
-        onFinished(req, function (err) {
-          assert.ok(err)
-          if (!--wait) server.close(done)
-        })
-
-        if (num === 1) {
-          // second request
-          writeRequest(socket, true)
-          req.pause()
-        } else {
-          // cause framing error in second request
-          socket.write('W')
-          req.resume()
+      it('should fire when called after finish', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 doesn't support CONNECT method in the same way as HTTP/1.1
+          return this.skip()
         }
-      })
-      var socket
-      var wait = 3
 
-      server.listen(function () {
-        socket = net.connect(this.address().port, function () {
-          writeRequest(this)
+        var client
+        var server = createServer(protocol, function (req, res) {
+          res.statusCode = 405
+          res.end()
         })
+        server.on('connect', function (req, socket, bodyHead) {
+          var data = [bodyHead]
 
-        socket.on('close', function () {
-          assert.strictEqual(count, 2)
-          if (!--wait) server.close(done)
-        })
-
-        socket.resume()
-      })
-    })
-  })
-
-  describe('when the request aborts', function () {
-    it('should execute the callback', function (done) {
-      var client
-      var server = http.createServer(function (req, res) {
-        onFinished(req, close(server, done))
-        setTimeout(client.abort.bind(client), 0)
-      })
-      server.listen(function () {
-        var port = this.address().port
-        client = http.get('http://127.0.0.1:' + port)
-        client.on('error', noop)
-      })
-    })
-  })
-
-  describe('when calling many times on same request', function () {
-    it('should not print warnings', function (done) {
-      var server = http.createServer(function (req, res) {
-        var stderr = captureStderr(function () {
-          for (var i = 0; i < 400; i++) {
-            onFinished(req, noop)
-          }
-        })
-
-        onFinished(req, done)
-        assert.strictEqual(stderr, '')
-        res.end()
-      })
-
-      server.listen(function () {
-        var port = this.address().port
-        http.get('http://127.0.0.1:' + port, function (res) {
-          res.resume()
-          res.on('end', server.close.bind(server))
-        })
-      })
-    })
-  })
-
-  describe('when CONNECT method', function () {
-    it('should fire when request finishes', function (done) {
-      var client
-      var server = http.createServer(function (req, res) {
-        res.statusCode = 405
-        res.end()
-      })
-      server.on('connect', function (req, socket, bodyHead) {
-        var data = [bodyHead]
-
-        onFinished(req, function (err) {
-          assert.ifError(err)
-          assert.strictEqual(Buffer.concat(data).toString(), 'knock, knock')
+          onFinished(req, function (err) {
+            assert.ifError(err)
+            assert.strictEqual(Buffer.concat(data).toString(), 'knock, knock')
+            socket.write('HTTP/1.1 200 OK\r\n\r\n')
+          })
 
           socket.on('data', function (chunk) {
             assert.strictEqual(chunk.toString(), 'ping')
-            socket.end('pong')
+            onFinished(req, function () {
+              socket.end('pong')
+            })
           })
-          socket.write('HTTP/1.1 200 OK\r\n\r\n')
-        })
 
-        req.on('data', function (chunk) {
-          data.push(chunk)
-        })
-      })
-
-      server.listen(function () {
-        client = http.request({
-          hostname: '127.0.0.1',
-          method: 'CONNECT',
-          path: '127.0.0.1:80',
-          port: this.address().port
-        })
-        client.on('connect', function (res, socket, bodyHead) {
-          socket.write('ping')
-          socket.on('data', function (chunk) {
-            assert.strictEqual(chunk.toString(), 'pong')
-            socket.end()
-            server.close(done)
+          req.on('data', function (chunk) {
+            data.push(chunk)
           })
         })
-        client.end('knock, knock')
+
+        server.listen(function () {
+          client = http.request({
+            hostname: '127.0.0.1',
+            method: 'CONNECT',
+            path: '127.0.0.1:80',
+            port: this.address().port
+          })
+          client.on('connect', function (res, socket, bodyHead) {
+            socket.write('ping')
+            socket.on('data', function (chunk) {
+              assert.strictEqual(chunk.toString(), 'pong')
+              socket.end()
+              server.close(done)
+            })
+          })
+          client.end('knock, knock')
+        })
       })
     })
 
-    it('should fire when called after finish', function (done) {
-      var client
-      var server = http.createServer(function (req, res) {
-        res.statusCode = 405
-        res.end()
-      })
-      server.on('connect', function (req, socket, bodyHead) {
-        var data = [bodyHead]
+    describe('when Upgrade request', function () {
+      it('should fire when request finishes', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 doesn't support HTTP/1.1 Upgrade mechanism
+          return this.skip()
+        }
 
-        onFinished(req, function (err) {
-          assert.ifError(err)
-          assert.strictEqual(Buffer.concat(data).toString(), 'knock, knock')
-          socket.write('HTTP/1.1 200 OK\r\n\r\n')
+        var client
+        var server = createServer(protocol, function (req, res) {
+          res.statusCode = 405
+          res.end()
         })
+        server.on('upgrade', function (req, socket, bodyHead) {
+          var data = [bodyHead]
 
-        socket.on('data', function (chunk) {
-          assert.strictEqual(chunk.toString(), 'ping')
-          onFinished(req, function () {
-            socket.end('pong')
+          onFinished(req, function (err) {
+            assert.ifError(err)
+            assert.strictEqual(Buffer.concat(data).toString(), 'knock, knock')
+
+            socket.on('data', function (chunk) {
+              assert.strictEqual(chunk.toString(), 'ping')
+              socket.end('pong')
+            })
+            socket.write('HTTP/1.1 101 Switching Protocols\r\n')
+            socket.write('Connection: Upgrade\r\n')
+            socket.write('Upgrade: Raw\r\n')
+            socket.write('\r\n')
+          })
+
+          req.on('data', function (chunk) {
+            data.push(chunk)
           })
         })
 
-        req.on('data', function (chunk) {
-          data.push(chunk)
-        })
-      })
-
-      server.listen(function () {
-        client = http.request({
-          hostname: '127.0.0.1',
-          method: 'CONNECT',
-          path: '127.0.0.1:80',
-          port: this.address().port
-        })
-        client.on('connect', function (res, socket, bodyHead) {
-          socket.write('ping')
-          socket.on('data', function (chunk) {
-            assert.strictEqual(chunk.toString(), 'pong')
-            socket.end()
-            server.close(done)
+        server.listen(function () {
+          client = http.request({
+            headers: {
+              Connection: 'Upgrade',
+              Upgrade: 'Raw'
+            },
+            hostname: '127.0.0.1',
+            port: this.address().port
           })
+
+          client.on('upgrade', function (res, socket, bodyHead) {
+            socket.write('ping')
+            socket.on('data', function (chunk) {
+              assert.strictEqual(chunk.toString(), 'pong')
+              socket.end()
+              server.close(done)
+            })
+          })
+          client.end('knock, knock')
         })
-        client.end('knock, knock')
       })
-    })
-  })
 
-  describe('when Upgrade request', function () {
-    it('should fire when request finishes', function (done) {
-      var client
-      var server = http.createServer(function (req, res) {
-        res.statusCode = 405
-        res.end()
-      })
-      server.on('upgrade', function (req, socket, bodyHead) {
-        var data = [bodyHead]
+      it('should fire when called after finish', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 doesn't support HTTP/1.1 Upgrade mechanism
+          return this.skip()
+        }
 
-        onFinished(req, function (err) {
-          assert.ifError(err)
-          assert.strictEqual(Buffer.concat(data).toString(), 'knock, knock')
+        var client
+        var server = createServer(protocol, function (req, res) {
+          res.statusCode = 405
+          res.end()
+        })
+        server.on('upgrade', function (req, socket, bodyHead) {
+          var data = [bodyHead]
+
+          onFinished(req, function (err) {
+            assert.ifError(err)
+            assert.strictEqual(Buffer.concat(data).toString(), 'knock, knock')
+
+            socket.write('HTTP/1.1 101 Switching Protocols\r\n')
+            socket.write('Connection: Upgrade\r\n')
+            socket.write('Upgrade: Raw\r\n')
+            socket.write('\r\n')
+          })
 
           socket.on('data', function (chunk) {
             assert.strictEqual(chunk.toString(), 'ping')
-            socket.end('pong')
+            onFinished(req, function () {
+              socket.end('pong')
+            })
           })
-          socket.write('HTTP/1.1 101 Switching Protocols\r\n')
-          socket.write('Connection: Upgrade\r\n')
-          socket.write('Upgrade: Raw\r\n')
-          socket.write('\r\n')
-        })
 
-        req.on('data', function (chunk) {
-          data.push(chunk)
-        })
-      })
-
-      server.listen(function () {
-        client = http.request({
-          headers: {
-            Connection: 'Upgrade',
-            Upgrade: 'Raw'
-          },
-          hostname: '127.0.0.1',
-          port: this.address().port
-        })
-
-        client.on('upgrade', function (res, socket, bodyHead) {
-          socket.write('ping')
-          socket.on('data', function (chunk) {
-            assert.strictEqual(chunk.toString(), 'pong')
-            socket.end()
-            server.close(done)
+          req.on('data', function (chunk) {
+            data.push(chunk)
           })
         })
-        client.end('knock, knock')
+
+        server.listen(function () {
+          client = http.request({
+            headers: {
+              Connection: 'Upgrade',
+              Upgrade: 'Raw'
+            },
+            hostname: '127.0.0.1',
+            port: this.address().port
+          })
+
+          client.on('upgrade', function (res, socket, bodyHead) {
+            socket.write('ping')
+            socket.on('data', function (chunk) {
+              assert.strictEqual(chunk.toString(), 'pong')
+              socket.end()
+              server.close(done)
+            })
+          })
+          client.end('knock, knock')
+        })
       })
     })
+  })
 
-    it('should fire when called after finish', function (done) {
-      var client
-      var server = http.createServer(function (req, res) {
-        res.statusCode = 405
+  describe(protocol + ' - isFinished(req)', function () {
+    it('should return undefined for unknown object', function () {
+      assert.strictEqual(onFinished.isFinished({}), undefined)
+    })
+
+    it('should be false before request finishes', function (done) {
+      var server = createServer(protocol, function (req, res) {
+        assert.ok(!onFinished.isFinished(req))
+        req.resume()
         res.end()
-      })
-      server.on('upgrade', function (req, socket, bodyHead) {
-        var data = [bodyHead]
-
-        onFinished(req, function (err) {
-          assert.ifError(err)
-          assert.strictEqual(Buffer.concat(data).toString(), 'knock, knock')
-
-          socket.write('HTTP/1.1 101 Switching Protocols\r\n')
-          socket.write('Connection: Upgrade\r\n')
-          socket.write('Upgrade: Raw\r\n')
-          socket.write('\r\n')
-        })
-
-        socket.on('data', function (chunk) {
-          assert.strictEqual(chunk.toString(), 'ping')
-          onFinished(req, function () {
-            socket.end('pong')
-          })
-        })
-
-        req.on('data', function (chunk) {
-          data.push(chunk)
-        })
-      })
-
-      server.listen(function () {
-        client = http.request({
-          headers: {
-            Connection: 'Upgrade',
-            Upgrade: 'Raw'
-          },
-          hostname: '127.0.0.1',
-          port: this.address().port
-        })
-
-        client.on('upgrade', function (res, socket, bodyHead) {
-          socket.write('ping')
-          socket.on('data', function (chunk) {
-            assert.strictEqual(chunk.toString(), 'pong')
-            socket.end()
-            server.close(done)
-          })
-        })
-        client.end('knock, knock')
-      })
-    })
-  })
-})
-
-describe('isFinished(req)', function () {
-  it('should return undefined for unknown object', function () {
-    assert.strictEqual(onFinished.isFinished({}), undefined)
-  })
-
-  it('should be false before request finishes', function (done) {
-    var server = http.createServer(function (req, res) {
-      assert.ok(!onFinished.isFinished(req))
-      req.resume()
-      res.end()
-      done()
-    })
-
-    sendGet(server)
-  })
-
-  it('should be true after request finishes', function (done) {
-    var server = http.createServer(function (req, res) {
-      onFinished(req, function (err) {
-        assert.ifError(err)
-        assert.ok(onFinished.isFinished(req))
         done()
       })
 
-      req.resume()
-      res.end()
-    })
-
-    sendGet(server)
-  })
-
-  describe('when request data buffered', function () {
-    it('should be false before request finishes', function (done) {
-      var server = http.createServer(function (req, res) {
-        assert.ok(!onFinished.isFinished(req))
-
-        req.pause()
-        setTimeout(function () {
-          assert.ok(!onFinished.isFinished(req))
-          req.resume()
-          res.end()
-          done()
-        }, 10)
-      })
-
-      sendGet(server)
-    })
-  })
-
-  describe('when request errors', function () {
-    it('should return true', function (done) {
-      var server = http.createServer(function (req, res) {
-        onFinished(req, function (err) {
-          assert.ok(err)
-          assert.ok(onFinished.isFinished(req))
-          server.close(done)
-        })
-
-        socket.on('error', noop)
-        socket.write('W')
-      })
-      var socket
-
-      server.listen(function () {
-        socket = net.connect(this.address().port, function () {
-          writeRequest(this, true)
-        })
-      })
-    })
-  })
-
-  describe('when the request aborts', function () {
-    it('should return true', function (done) {
-      var client
-      var server = http.createServer(function (req, res) {
-        onFinished(res, function (err) {
-          assert.ifError(err)
-          assert.ok(onFinished.isFinished(req))
-          server.close(done)
-        })
-        setTimeout(client.abort.bind(client), 0)
-      })
-      server.listen(function () {
-        var port = this.address().port
-        client = http.get('http://127.0.0.1:' + port)
-        client.on('error', noop)
-      })
-    })
-  })
-
-  describe('when CONNECT method', function () {
-    it('should be true immediately', function (done) {
-      var client
-      var server = http.createServer(function (req, res) {
-        res.statusCode = 405
-        res.end()
-      })
-
-      server.on('connect', function (req, socket, bodyHead) {
-        assert.ok(onFinished.isFinished(req))
-        assert.strictEqual(bodyHead.length, 0)
-        req.resume()
-
-        socket.on('data', function (chunk) {
-          assert.strictEqual(chunk.toString(), 'ping')
-          socket.end('pong')
-        })
-        socket.write('HTTP/1.1 200 OK\r\n\r\n')
-      })
-
-      server.listen(function () {
-        client = http.request({
-          hostname: '127.0.0.1',
-          method: 'CONNECT',
-          path: '127.0.0.1:80',
-          port: this.address().port
-        })
-
-        client.on('connect', function (res, socket, bodyHead) {
-          socket.write('ping')
-          socket.on('data', function (chunk) {
-            assert.strictEqual(chunk.toString(), 'pong')
-            socket.end()
-            server.close(done)
-          })
-        })
-        client.end()
-      })
+      sendGet(server, protocol)
     })
 
     it('should be true after request finishes', function (done) {
-      var client
-      var server = http.createServer(function (req, res) {
-        res.statusCode = 405
-        res.end()
-      })
-      server.on('connect', function (req, socket, bodyHead) {
-        var data = [bodyHead]
-
+      var server = createServer(protocol, function (req, res) {
         onFinished(req, function (err) {
           assert.ifError(err)
           assert.ok(onFinished.isFinished(req))
-          assert.strictEqual(Buffer.concat(data).toString(), 'knock, knock')
+          done()
+        })
+
+        req.resume()
+        res.end()
+      })
+
+      sendGet(server, protocol)
+    })
+
+    describe('when request data buffered', function () {
+      it('should be false before request finishes', function (done) {
+        var server = createServer(protocol, function (req, res) {
+          assert.ok(!onFinished.isFinished(req))
+
+          req.pause()
+          setTimeout(function () {
+            assert.ok(!onFinished.isFinished(req))
+            req.resume()
+            res.end()
+            done()
+          }, 10)
+        })
+
+        sendGet(server, protocol)
+      })
+    })
+
+    describe('when request errors', function () {
+      it('should return true', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 error handling is different - raw socket manipulation doesn't apply
+          return this.skip()
+        }
+
+        var server = createServer(protocol, function (req, res) {
+          onFinished(req, function (err) {
+            assert.ok(err)
+            assert.ok(onFinished.isFinished(req))
+            server.close(done)
+          })
+
+          socket.on('error', noop)
+          socket.write('W')
+        })
+        var socket
+
+        server.listen(function () {
+          socket = net.connect(this.address().port, function () {
+            writeRequest(this, true)
+          })
+        })
+      })
+    })
+
+    describe('when the request aborts', function () {
+      it('should return true', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 abort mechanism is different - need to test with HTTP2-specific abort
+          return this.skip()
+        }
+
+        var client
+        var server = createServer(protocol, function (req, res) {
+          onFinished(res, function (err) {
+            assert.ifError(err)
+            assert.ok(onFinished.isFinished(req))
+            server.close(done)
+          })
+          setTimeout(client.abort.bind(client), 0)
+        })
+        server.listen(function () {
+          var port = this.address().port
+          client = http.get('http://127.0.0.1:' + port)
+          client.on('error', noop)
+        })
+      })
+    })
+
+    describe('when CONNECT method', function () {
+      it('should be true immediately', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 doesn't support CONNECT method in the same way as HTTP/1.1
+          return this.skip()
+        }
+
+        var client
+        var server = createServer(protocol, function (req, res) {
+          res.statusCode = 405
+          res.end()
+        })
+
+        server.on('connect', function (req, socket, bodyHead) {
+          assert.ok(onFinished.isFinished(req))
+          assert.strictEqual(bodyHead.length, 0)
+          req.resume()
+
+          socket.on('data', function (chunk) {
+            assert.strictEqual(chunk.toString(), 'ping')
+            socket.end('pong')
+          })
           socket.write('HTTP/1.1 200 OK\r\n\r\n')
         })
 
-        socket.on('data', function (chunk) {
-          assert.strictEqual(chunk.toString(), 'ping')
-          socket.end('pong')
-        })
+        server.listen(function () {
+          client = http.request({
+            hostname: '127.0.0.1',
+            method: 'CONNECT',
+            path: '127.0.0.1:80',
+            port: this.address().port
+          })
 
-        req.on('data', function (chunk) {
-          data.push(chunk)
+          client.on('connect', function (res, socket, bodyHead) {
+            socket.write('ping')
+            socket.on('data', function (chunk) {
+              assert.strictEqual(chunk.toString(), 'pong')
+              socket.end()
+              server.close(done)
+            })
+          })
+          client.end()
         })
       })
 
-      server.listen(function () {
-        client = http.request({
-          hostname: '127.0.0.1',
-          method: 'CONNECT',
-          path: '127.0.0.1:80',
-          port: this.address().port
+      it('should be true after request finishes', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 doesn't support CONNECT method in the same way as HTTP/1.1
+          return this.skip()
+        }
+
+        var client
+        var server = createServer(protocol, function (req, res) {
+          res.statusCode = 405
+          res.end()
         })
-        client.on('connect', function (res, socket, bodyHead) {
-          socket.write('ping')
+        server.on('connect', function (req, socket, bodyHead) {
+          var data = [bodyHead]
+
+          onFinished(req, function (err) {
+            assert.ifError(err)
+            assert.ok(onFinished.isFinished(req))
+            assert.strictEqual(Buffer.concat(data).toString(), 'knock, knock')
+            socket.write('HTTP/1.1 200 OK\r\n\r\n')
+          })
+
           socket.on('data', function (chunk) {
-            assert.strictEqual(chunk.toString(), 'pong')
-            socket.end()
-            server.close(done)
+            assert.strictEqual(chunk.toString(), 'ping')
+            socket.end('pong')
+          })
+
+          req.on('data', function (chunk) {
+            data.push(chunk)
           })
         })
-        client.end('knock, knock')
-      })
-    })
-  })
 
-  describe('when Upgrade request', function () {
-    it('should be true immediately', function (done) {
-      var client
-      var server = http.createServer(function (req, res) {
-        res.statusCode = 405
-        res.end()
-      })
-
-      server.on('upgrade', function (req, socket, bodyHead) {
-        assert.ok(onFinished.isFinished(req))
-        assert.strictEqual(bodyHead.length, 0)
-        req.resume()
-
-        socket.on('data', function (chunk) {
-          assert.strictEqual(chunk.toString(), 'ping')
-          socket.end('pong')
-        })
-        socket.write('HTTP/1.1 101 Switching Protocols\r\n')
-        socket.write('Connection: Upgrade\r\n')
-        socket.write('Upgrade: Raw\r\n')
-        socket.write('\r\n')
-      })
-
-      server.listen(function () {
-        client = http.request({
-          headers: {
-            Connection: 'Upgrade',
-            Upgrade: 'Raw'
-          },
-          hostname: '127.0.0.1',
-          port: this.address().port
-        })
-
-        client.on('upgrade', function (res, socket, bodyHead) {
-          socket.write('ping')
-          socket.on('data', function (chunk) {
-            assert.strictEqual(chunk.toString(), 'pong')
-            socket.end()
-            server.close(done)
+        server.listen(function () {
+          client = http.request({
+            hostname: '127.0.0.1',
+            method: 'CONNECT',
+            path: '127.0.0.1:80',
+            port: this.address().port
           })
+          client.on('connect', function (res, socket, bodyHead) {
+            socket.write('ping')
+            socket.on('data', function (chunk) {
+              assert.strictEqual(chunk.toString(), 'pong')
+              socket.end()
+              server.close(done)
+            })
+          })
+          client.end('knock, knock')
         })
-        client.end()
       })
     })
 
-    it('should be true after request finishes', function (done) {
-      var client
-      var server = http.createServer(function (req, res) {
-        res.statusCode = 405
-        res.end()
-      })
-      server.on('upgrade', function (req, socket, bodyHead) {
-        var data = [bodyHead]
+    describe('when Upgrade request', function () {
+      it('should be true immediately', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 doesn't support HTTP/1.1 Upgrade mechanism
+          return this.skip()
+        }
 
-        onFinished(req, function (err) {
-          assert.ifError(err)
+        var client
+        var server = createServer(protocol, function (req, res) {
+          res.statusCode = 405
+          res.end()
+        })
+
+        server.on('upgrade', function (req, socket, bodyHead) {
           assert.ok(onFinished.isFinished(req))
-          assert.strictEqual(Buffer.concat(data).toString(), 'knock, knock')
+          assert.strictEqual(bodyHead.length, 0)
+          req.resume()
 
+          socket.on('data', function (chunk) {
+            assert.strictEqual(chunk.toString(), 'ping')
+            socket.end('pong')
+          })
           socket.write('HTTP/1.1 101 Switching Protocols\r\n')
           socket.write('Connection: Upgrade\r\n')
           socket.write('Upgrade: Raw\r\n')
           socket.write('\r\n')
         })
 
-        socket.on('data', function (chunk) {
-          assert.strictEqual(chunk.toString(), 'ping')
-          socket.end('pong')
-        })
+        server.listen(function () {
+          client = http.request({
+            headers: {
+              Connection: 'Upgrade',
+              Upgrade: 'Raw'
+            },
+            hostname: '127.0.0.1',
+            port: this.address().port
+          })
 
-        req.on('data', function (chunk) {
-          data.push(chunk)
+          client.on('upgrade', function (res, socket, bodyHead) {
+            socket.write('ping')
+            socket.on('data', function (chunk) {
+              assert.strictEqual(chunk.toString(), 'pong')
+              socket.end()
+              server.close(done)
+            })
+          })
+          client.end()
         })
       })
 
-      server.listen(function () {
-        client = http.request({
-          headers: {
-            Connection: 'Upgrade',
-            Upgrade: 'Raw'
-          },
-          hostname: '127.0.0.1',
-          port: this.address().port
-        })
+      it('should be true after request finishes', function (done) {
+        if (protocol === 'http2') {
+          // HTTP2 doesn't support HTTP/1.1 Upgrade mechanism
+          return this.skip()
+        }
 
-        client.on('upgrade', function (res, socket, bodyHead) {
-          socket.write('ping')
+        var client
+        var server = createServer(protocol, function (req, res) {
+          res.statusCode = 405
+          res.end()
+        })
+        server.on('upgrade', function (req, socket, bodyHead) {
+          var data = [bodyHead]
+
+          onFinished(req, function (err) {
+            assert.ifError(err)
+            assert.ok(onFinished.isFinished(req))
+            assert.strictEqual(Buffer.concat(data).toString(), 'knock, knock')
+
+            socket.write('HTTP/1.1 101 Switching Protocols\r\n')
+            socket.write('Connection: Upgrade\r\n')
+            socket.write('Upgrade: Raw\r\n')
+            socket.write('\r\n')
+          })
+
           socket.on('data', function (chunk) {
-            assert.strictEqual(chunk.toString(), 'pong')
-            socket.end()
-            server.close(done)
+            assert.strictEqual(chunk.toString(), 'ping')
+            socket.end('pong')
+          })
+
+          req.on('data', function (chunk) {
+            data.push(chunk)
           })
         })
-        client.end('knock, knock')
+
+        server.listen(function () {
+          client = http.request({
+            headers: {
+              Connection: 'Upgrade',
+              Upgrade: 'Raw'
+            },
+            hostname: '127.0.0.1',
+            port: this.address().port
+          })
+
+          client.on('upgrade', function (res, socket, bodyHead) {
+            socket.write('ping')
+            socket.on('data', function (chunk) {
+              assert.strictEqual(chunk.toString(), 'pong')
+              socket.end()
+              server.close(done)
+            })
+          })
+          client.end('knock, knock')
+        })
       })
     })
   })
-})
+}
+
+// Helper function to create server based on protocol
+function createServer (protocol, requestHandler) {
+  if (protocol === 'http2') {
+    return http2.createServer(requestHandler)
+  } else {
+    return http.createServer(requestHandler)
+  }
+}
 
 function captureStderr (fn) {
   var chunks = []
@@ -1152,14 +1294,39 @@ function close (server, callback) {
 
 function noop () {}
 
-function sendGet (server) {
-  server.listen(function onListening () {
-    var port = this.address().port
-    http.get('http://127.0.0.1:' + port, function onResponse (res) {
-      res.resume()
-      res.on('end', server.close.bind(server))
+function sendGet (server, protocol) {
+  if (protocol === 'http2') {
+    server.listen(function onListening () {
+      var port = this.address().port
+      var client = http2.connect('http://127.0.0.1:' + port)
+
+      var req = client.request({ ':path': '/' })
+      req.on('response', function onResponse (headers) {
+        req.on('data', function (chunk) {
+          /* consume data */
+        })
+        req.on('end', function () {
+          client.close()
+          server.close()
+        })
+      })
+      // eslint-disable-next-line handle-callback-err
+      req.on('error', function (err) {
+        client.close()
+        server.close()
+      })
+      req.end()
     })
-  })
+  } else {
+    server.listen(function onListening () {
+      var port = this.address().port
+      http
+        .get('http://127.0.0.1:' + port, function onResponse (res) {
+          res.resume()
+          res.on('end', server.close.bind(server))
+        })
+    })
+  }
 }
 
 function writeRequest (socket, chunked) {
